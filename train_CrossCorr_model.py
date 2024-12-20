@@ -1,94 +1,80 @@
-from lib.models.CLIPResNetCrossCorrGen.train_utils import *
-from lib.models.CLIPResNetCrossCorrGen.CCPDetector import CCPromptDetector
-from lib.models.CLIPResNetCrossCorrGen.train_utils import train_process
-from lib.utils.MOTdataset import OmniDetection
-from torch.utils.data import DataLoader
-from argparse import Namespace
-import albumentations as A
-
-root_dir = '/media/ilya/FastDisk/Datasets/Omnilabels/data/'
-ann_path = '/media/ilya/FastDisk/Datasets/Omnilabels/dataset_all_val_v0.1.4.json'
-
-custom_config = {
-    'num_classes': 2,
-    'feature_maps': [(31, 31), (16, 16), (8, 8), (5, 5), (2, 2)],
-
-    'min_sizes': [0.10, 0.20, 0.37, 0.62, 0.84],
-    'max_sizes': [0.20, 0.37, 0.62, 0.84, 1.05],
-    'aspect_ratios': [[2, 3], [2, 3], [2, 3], [2, 3], [2]],
-    'num_priors': [6, 6, 6, 6, 4],
-    'variance': [0.1, 0.2],
-    'clip': True,
-
-    'overlap_threshold': 0.25,
-    'neg_pos_ratio': 3,
-
-    'model_name': 'test'
-}
-
-param_s = Namespace(
-    epochs=400, batch_size=24,
-    checkpoint=None, output='output',
-    multistep=[20, 30, 40],
-    learning_rate=5e-3, momentum=0.9,
-    weight_decay=0.00005, warmup=None,
-    num_workers=30,
-    seed=0
-)
-
-model = CCPromptDetector(custom_config)
-model = model.cuda().train()
-
-SIZE = 360
-bbox_params = A.BboxParams(format='albumentations', min_area=0, min_visibility=0.0, label_fields=['labels'])
-
-light_transform = A.Compose([
-    A.HorizontalFlip(p=0.5),
-    # A.RandomResizedCrop(height=257, width=257, p=0.5, scale=(0.7, 1.0)),
-    A.Resize(height=SIZE, width=SIZE),
-    A.GaussNoise(var_limit=(100, 150), p=0.5),
-    A.RGBShift(p=0.5),
-    A.Blur(blur_limit=11, p=0.5),
-    A.RandomBrightnessContrast(p=0.5),
-    A.CLAHE(p=0.5),
-    A.augmentations.transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), always_apply=True),
-    A.pytorch.transforms.ToTensorV2()
-], bbox_params=bbox_params, p=1.0)
-
-test_transform = A.Compose([
-    # A.HorizontalFlip(p=0.5),
-    # A.RandomResizedCrop(height=257, width=257, p=0.5, scale=(0.7, 1.0)),
-    A.Resize(height=SIZE, width=SIZE),
-    A.augmentations.transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), always_apply=True),
-    A.pytorch.transforms.ToTensorV2()
-], bbox_params=bbox_params, p=1.0)
+import torch
+from torch import nn
 
 
-def default_collate(batch):
-    label_ss, box_ss, image_s = [], [], []
+class Head(nn.Module):
+    def __init__(self):
+        super(Head, self).__init__()
 
-    for sample in batch:
-        image, box_s, label_s = sample
+        def create_block(in_channels, out_channels, kernel_size, stride, padding):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
+                nn.GroupNorm(out_channels, out_channels),
+                nn.ReLU(inplace=True)
+            )
 
-        if len(box_s) > 0 and len(label_s) > 0:
-            image_s.append(image)
-            box_ss.append(box_s)
-            label_ss.append(label_s)
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(768, 768, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.GroupNorm(768, 768),
+            nn.ReLU(inplace=True),
+        )
 
-    return torch.stack(image_s) if len(image_s) > 0 else torch.Tensor(), box_ss, label_ss
+        self.downsample_blocks = nn.ModuleList([
+            nn.Sequential(
+                create_block(768, 768, 3, 1, 0),
+                create_block(768, 512, 4, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+            ),
+            nn.Sequential(
+                create_block(768, 768, 3, 1, 0),
+                create_block(768, 512, 3, 1, 0),
+            ),
+            nn.Sequential(
+                create_block(768, 768, 3, 2, 1),
+                create_block(768, 512, 3, 1, 1),
+                create_block(512, 512, 3, 1, 1),
+                create_block(512, 512, 3, 1, 0),
+            ),
+            nn.Sequential(
+                create_block(768, 768, 3, 2, 0),
+                create_block(768, 512, 3, 1, 1),
+                create_block(512, 512, 3, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+            ),
+            nn.Sequential(
+                create_block(768, 768, 3, 2, 1),
+                create_block(768, 512, 3, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+                create_block(512, 512, 3, 1, 0),
+            ),
+        ])
 
+        self.clss = nn.ModuleList([
+                                      create_block(512, 12, 3, 1, 1) for _ in range(4)
+                                  ] + [create_block(512, 8, 3, 1, 1)])
 
-data = OmniDetection(root_dir, ann_path, light_transform)
+        self.locs = nn.ModuleList([
+                                      create_block(512, 24, 3, 1, 1) for _ in range(4)
+                                  ] + [create_block(512, 16, 3, 1, 1)])
 
-n_tr = int(len(data) * 0.8)
+    def forward(self, x):
+        x[0] = self.upsample(x[0])
 
-train_set, val_set = torch.utils.data.random_split(data, [n_tr, len(data) - n_tr],
-                                                   generator=torch.Generator().manual_seed(param_s.seed))
+        for i in range(5):
+            x[i] = self.downsample_blocks[i](x[i])
 
-val_set.dataset.sample_transform = test_transform
+        cls_out, loc_out = [], []
 
-dataloaders = {'train': DataLoader(train_set, num_workers=param_s.num_workers, batch_size=param_s.batch_size, shuffle=True, collate_fn=default_collate,
-                                   drop_last=True),
-               'test': DataLoader(val_set, num_workers=param_s.num_workers, batch_size=param_s.batch_size, shuffle=False, collate_fn=default_collate), }
+        for i in range(5):
+            cls_out.append(self.clss[i](x[i]))
+            loc_out.append(self.locs[i](x[i]))
 
-model, prior_box_s, train_loss_s, eval_loss_s = train_process(model, dataloaders, param_s, custom_config)
+        cls_out = torch.cat([c.permute(0, 2, 3, 1).contiguous().view(c.size(0), -1) for c in cls_out], dim=1)
+        loc_out = torch.cat([l.permute(0, 2, 3, 1).contiguous().view(l.size(0), -1) for l in loc_out], dim=1)
+
+        cls_out = cls_out.view(cls_out.size(0), -1, 2)
+        loc_out = loc_out.view(loc_out.size(0), -1, 4)
+
+        return loc_out, cls_out
